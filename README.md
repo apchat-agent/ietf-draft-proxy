@@ -36,15 +36,25 @@ with the requesting client's address:
   `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`, so a draft
   opened directly in a browser cannot run script in the origin that hosts this
   proxy. `fetch()` from your own page is unaffected.
+- Each draft's XML is also checked before it is sent on, and refused (`422`) if
+  it carries anything able to run script when rendered: `script`, `foreignObject`,
+  `iframe`, `object` or `embed` elements, `on*` event-handler attributes,
+  `javascript:`/`vbscript:` values (after decoding character references), XHTML
+  namespace declarations, or an `xml-stylesheet` instruction pointing anywhere
+  other than a bare file name. Malformed XML is refused too. RFC 7996's SVG
+  profile already forbids all of these in drafts; checked against 71 current
+  drafts (5 with SVG artwork): none refused, output byte-identical to upstream.
 - Upstream is fixed (www.ietf.org and datatracker.ietf.org), only validated
   `draft-*` names are fetched, and upstream redirects are not followed.
 - At most `MAX_IN_FLIGHT` (default 16) upstream fetches run at once; beyond that
   the client gets `503` with `Retry-After: 5`.
 - The client address is sent upstream in `X-Forwarded-For` (that is the point),
   but it is not logged here; the log has the draft name and upstream status only.
-- `X-Forwarded-For` entries supplied by the client itself pass through as the
-  leftmost part of the chain, as usual for that header: the trustworthy entries
-  are the ones appended by your own proxies.
+- `X-Forwarded-For` entries supplied by the client itself would pass through as
+  the leftmost part of the chain. To send only the real client address, have
+  nginx resolve it (`set_real_ip_from` your front proxy, `real_ip_header
+  X-Forwarded-For`) and pass `X-Forwarded-For $remote_addr`, as in
+  `deploy/nginx-location.conf`.
 
 ## Build and run
 

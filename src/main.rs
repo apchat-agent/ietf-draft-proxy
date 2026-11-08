@@ -36,6 +36,8 @@ const XFF: HeaderName = HeaderName::from_static("x-forwarded-for");
 /// Upstream fetches in flight at once; beyond this the client gets 503.
 /// Keeps one client from making this host hammer www.ietf.org / datatracker.
 const DEFAULT_MAX_IN_FLIGHT: usize = 16;
+/// Largest draft XML accepted for checking (the largest drafts are a few MB).
+const MAX_XML_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Clone)]
 struct App {
@@ -65,6 +67,95 @@ fn valid_draft_file(file: &str) -> bool {
         return false;
     };
     valid_draft_name(name) && rev.len() == 2 && rev.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Second line of defence behind the CSP sandbox: refuse XML that carries anything
+/// able to run script when a browser renders it. RFC XML v3 may embed SVG artwork,
+/// and RFC 7996's SVG profile already forbids script, event handlers and foreign
+/// content there, so a real draft never trips this. Malformed XML is refused too
+/// (fail closed).
+fn active_content(xml: &[u8]) -> Option<String> {
+    use quick_xml::events::Event;
+    const ELEMENTS: [&str; 5] = ["script", "foreignobject", "iframe", "object", "embed"];
+    let mut reader = quick_xml::Reader::from_reader(xml);
+    let mut buf = Vec::new();
+    loop {
+        let event = match reader.read_event_into(&mut buf) {
+            Ok(e) => e,
+            Err(e) => return Some(format!("not well-formed XML: {e}")),
+        };
+        match &event {
+            Event::Start(e) | Event::Empty(e) => {
+                let local = String::from_utf8_lossy(e.local_name().as_ref()).to_ascii_lowercase();
+                if ELEMENTS.contains(&local.as_str()) {
+                    return Some(format!("<{local}> element"));
+                }
+                for attr in e.attributes().with_checks(false) {
+                    let Ok(attr) = attr else {
+                        return Some("malformed attribute".into());
+                    };
+                    let key = String::from_utf8_lossy(attr.key.as_ref()).to_ascii_lowercase();
+                    let name = key.rsplit(':').next().unwrap_or(&key);
+                    if name.len() > 2
+                        && name.starts_with("on")
+                        && name[2..].bytes().all(|b| b.is_ascii_alphabetic())
+                    {
+                        return Some(format!("event handler attribute {key}"));
+                    }
+                    // Decode character references first: "java&#x09;script:" is a script URI.
+                    let decoded = match attr.unescape_value() {
+                        Ok(v) => v.into_owned(),
+                        Err(_) => String::from_utf8_lossy(&attr.value).into_owned(),
+                    };
+                    let value: String = decoded
+                        .chars()
+                        .filter(|c| !c.is_whitespace() && !c.is_control())
+                        .collect::<String>()
+                        .to_ascii_lowercase();
+                    if value.contains("javascript:") || value.contains("vbscript:") {
+                        return Some(format!("script URI in attribute {key}"));
+                    }
+                    if key.starts_with("xmlns") && value.contains("w3.org/1999/xhtml") {
+                        return Some("XHTML namespace".into());
+                    }
+                }
+            }
+            Event::PI(pi) => {
+                let target = String::from_utf8_lossy(pi.target()).to_ascii_lowercase();
+                // Many drafts carry the authoring template's
+                // <?xml-stylesheet href="rfc2629.xslt"?>: a bare file name resolves to
+                // this proxy (which serves no XSLT) and CSP blocks it anyway. Anything
+                // that could reach another origin or path is refused.
+                if target == "xml-stylesheet" && !plain_stylesheet_href(pi.content()) {
+                    return Some("xml-stylesheet processing instruction".into());
+                }
+            }
+            Event::Eof => return None,
+            _ => {}
+        }
+        buf.clear();
+    }
+}
+
+/// True if an xml-stylesheet PI's `href` is a bare file name such as `rfc2629.xslt`.
+fn plain_stylesheet_href(content: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(content);
+    let Some(start) = text.find("href=") else {
+        return false;
+    };
+    let rest = &text[start + 5..];
+    let Some(quote) = rest.chars().next().filter(|c| *c == '"' || *c == '\'') else {
+        return false;
+    };
+    let Some(end) = rest[1..].find(quote) else {
+        return false;
+    };
+    let href = &rest[1..1 + end];
+    !href.is_empty()
+        && !href.starts_with('.')
+        && href
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'_')
 }
 
 /// The X-Forwarded-For value to send upstream (see the module comment).
@@ -189,6 +280,9 @@ async fn draft(
         _ => return plain(StatusCode::BAD_GATEWAY, "unexpected upstream status\n"),
     }
 
+    // A GET with a body is checked whole before any of it is sent on;
+    // HEAD and 304 carry no body.
+    let check = method != Method::HEAD && status == 200;
     let mut out = HeaderMap::new();
     for h in [
         header::ETAG,
@@ -196,6 +290,9 @@ async fn draft(
         header::CACHE_CONTROL,
         header::CONTENT_LENGTH,
     ] {
+        if check && h == header::CONTENT_LENGTH {
+            continue;
+        }
         if let Some(v) = upstream
             .headers()
             .get(h.as_str())
@@ -210,6 +307,34 @@ async fn draft(
     );
     common_headers(&mut out);
     let code = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
+    if check {
+        if upstream
+            .content_length()
+            .is_some_and(|n| n > MAX_XML_BYTES as u64)
+        {
+            return plain(StatusCode::BAD_GATEWAY, "draft XML too large\n");
+        }
+        let mut body = Vec::new();
+        let mut stream = upstream.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let Ok(chunk) = chunk else {
+                return plain(StatusCode::BAD_GATEWAY, "upstream read failed\n");
+            };
+            if body.len() + chunk.len() > MAX_XML_BYTES {
+                return plain(StatusCode::BAD_GATEWAY, "draft XML too large\n");
+            }
+            body.extend_from_slice(&chunk);
+        }
+        drop(permit);
+        if let Some(why) = active_content(&body) {
+            eprintln!("{file}: refused: {why}");
+            return plain(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "draft XML refused: it contains active content (script, event handler or similar)\n",
+            );
+        }
+        return (code, out, Body::from(body)).into_response();
+    }
     (
         code,
         out,
@@ -322,6 +447,36 @@ mod tests {
         assert!(valid_draft_name("draft-ietf-intarea-proxy-config"));
         assert!(!valid_draft_name("draft-ietf-foo.xml"));
         assert!(!valid_draft_name("draft-"));
+    }
+
+    #[test]
+    fn active_content_is_refused() {
+        let bad = [
+            r#"<rfc><x:script xmlns:x="http://www.w3.org/1999/xhtml">alert(1)</x:script></rfc>"#,
+            r#"<rfc><artwork type="svg"><svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg></artwork></rfc>"#,
+            r#"<rfc><artwork><svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)"/></artwork></rfc>"#,
+            r#"<rfc><svg xmlns="http://www.w3.org/2000/svg"><a xmlns:xl="http://www.w3.org/1999/xlink" xl:href=" Java&#x09;Script:alert(1)">x</a></svg></rfc>"#,
+            r#"<rfc><eref target="javascript:alert(1)"/></rfc>"#,
+            r#"<?xml-stylesheet type="text/xsl" href="https://evil.example/x.xsl"?><rfc/>"#,
+            r#"<?xml-stylesheet type="text/xsl" href="//evil.example/x.xsl"?><rfc/>"#,
+            r#"<?xml-stylesheet type="text/xsl" href="../x.xsl"?><rfc/>"#,
+            r#"<?xml-stylesheet type="text/xsl" href="data:text/xsl,x"?><rfc/>"#,
+            r#"<rfc><svg xmlns="http://www.w3.org/2000/svg"><foreignObject><p>x</p></foreignObject></svg></rfc>"#,
+            r#"<rfc xmlns:h="http://www.w3.org/1999/xhtml"><h:p>x</h:p></rfc>"#,
+            r#"<rfc><unclosed></rfc>"#,
+        ];
+        for b in bad {
+            assert!(active_content(b.as_bytes()).is_some(), "not refused: {b}");
+        }
+        let good = r#"<?xml version="1.0" encoding="utf-8"?>
+<?xml-stylesheet type="text/xsl" href="rfc2629.xslt" ?>
+<!DOCTYPE rfc [ <!ENTITY nbsp "&#160;"> ]>
+<rfc xmlns:xi="http://www.w3.org/2001/XInclude" docName="draft-x-00" category="std">
+<front><title>On the onset of options</title></front>
+<middle><section anchor="one"><t>See <eref target="https://example.org/"/>.</t>
+<artwork type="svg"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><rect width="10" height="10"/></svg></artwork>
+</section></middle></rfc>"#;
+        assert_eq!(active_content(good.as_bytes()), None);
     }
 
     #[test]
