@@ -1,0 +1,18 @@
+[Unit]
+Description=CORS proxy for IETF draft XML (/archive/id/), behind nginx
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Environment=LISTEN=127.0.0.1:8096
+ExecStart=/usr/local/bin/ietf-draft-proxy
+DynamicUser=yes
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

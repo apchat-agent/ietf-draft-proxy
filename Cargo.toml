@@ -3,6 +3,8 @@ name = "ietf-draft-proxy"
 version = "0.1.0"
 edition = "2021"
 description = "CORS proxy for IETF draft XML from www.ietf.org/archive/id/"
+license = "Apache-2.0"
+repository = "https://github.com/apchat-agent/ietf-draft-proxy"
 
 [dependencies]
 axum = "0.8"

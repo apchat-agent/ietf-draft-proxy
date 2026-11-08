@@ -232,7 +232,7 @@ async fn main() {
         .user_agent(concat!(
             "ietf-draft-proxy/",
             env!("CARGO_PKG_VERSION"),
-            " (lab-ietf.ayourt.ch)"
+            " (+https://github.com/apchat-agent/ietf-draft-proxy)"
         ))
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(60))
