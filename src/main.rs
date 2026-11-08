@@ -10,8 +10,14 @@
 //! `X-Forwarded-For: $proxy_add_x_forwarded_for`, which already ends with the client
 //! address, so a request from a loopback peer passes that header on unchanged.
 //! A request from any other peer gets the peer address appended.
+//!
+//! Draft XML is third-party content (anyone can post an Internet-Draft), so every
+//! response carries `Content-Security-Policy: sandbox` and `nosniff`: a draft opened
+//! directly in a browser cannot run script in this site's origin. Client addresses
+//! are sent upstream (by design) but are not logged here.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
@@ -22,14 +28,19 @@ use axum::{
     routing::get,
     Router,
 };
+use futures_util::StreamExt;
 
 const UPSTREAM: &str = "https://www.ietf.org/archive/id/";
 const DATATRACKER: &str = "https://datatracker.ietf.org/doc/";
 const XFF: HeaderName = HeaderName::from_static("x-forwarded-for");
+/// Upstream fetches in flight at once; beyond this the client gets 503.
+/// Keeps one client from making this host hammer www.ietf.org / datatracker.
+const DEFAULT_MAX_IN_FLIGHT: usize = 16;
 
 #[derive(Clone)]
 struct App {
     client: reqwest::Client,
+    slots: Arc<tokio::sync::Semaphore>,
 }
 
 /// `draft-<name>`: lowercase letters, digits and single hyphens.
@@ -78,7 +89,20 @@ fn forwarded_for(headers: &HeaderMap, peer: SocketAddr) -> String {
     }
 }
 
-fn cors(headers: &mut HeaderMap) {
+/// CORS plus the headers that keep third-party XML inert in this origin.
+fn common_headers(headers: &mut HeaderMap) {
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("default-src 'none'; sandbox"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
     headers.insert(
         header::ACCESS_CONTROL_ALLOW_ORIGIN,
         HeaderValue::from_static("*"),
@@ -103,7 +127,7 @@ fn cors(headers: &mut HeaderMap) {
 
 fn plain(status: StatusCode, msg: &'static str) -> Response {
     let mut resp = (status, msg).into_response();
-    cors(resp.headers_mut());
+    common_headers(resp.headers_mut());
     resp
 }
 
@@ -117,6 +141,13 @@ async fn draft(
     if method == Method::OPTIONS {
         return plain(StatusCode::NO_CONTENT, "");
     }
+    // Held until the response body has been fully streamed (moved into it below).
+    let Ok(permit) = app.slots.clone().try_acquire_owned() else {
+        let mut resp = plain(StatusCode::SERVICE_UNAVAILABLE, "busy, retry shortly\n");
+        resp.headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+        return resp;
+    };
     let xff = forwarded_for(&headers, peer);
     if !file.ends_with(".xml") && valid_draft_name(&file) {
         return latest(&app, &file, &xff).await;
@@ -146,12 +177,12 @@ async fn draft(
     let upstream = match req.send().await {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("{file} xff={xff}: upstream error: {e}");
+            eprintln!("{file}: upstream error: {e}");
             return plain(StatusCode::BAD_GATEWAY, "upstream fetch failed\n");
         }
     };
     let status = upstream.status().as_u16();
-    eprintln!("{file} xff={xff}: {status}");
+    eprintln!("{file}: {status}");
     match status {
         200 | 304 => {}
         404 | 410 => return plain(StatusCode::NOT_FOUND, "no such draft revision\n"),
@@ -177,9 +208,17 @@ async fn draft(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/xml; charset=utf-8"),
     );
-    cors(&mut out);
+    common_headers(&mut out);
     let code = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
-    (code, out, Body::from_stream(upstream.bytes_stream())).into_response()
+    (
+        code,
+        out,
+        Body::from_stream(upstream.bytes_stream().map(move |chunk| {
+            let _held = &permit;
+            chunk
+        })),
+    )
+        .into_response()
 }
 
 /// Redirects `draft-<name>` to the XML of its latest revision, per datatracker.
@@ -193,13 +232,13 @@ async fn latest(app: &App, name: &str, xff: &str) -> Response {
     {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("{name} xff={xff}: datatracker error: {e}");
+            eprintln!("{name}: datatracker error: {e}");
             return plain(StatusCode::BAD_GATEWAY, "datatracker lookup failed\n");
         }
     };
     let status = resp.status().as_u16();
     if status == 404 {
-        eprintln!("{name} xff={xff}: datatracker 404");
+        eprintln!("{name}: datatracker 404");
         return plain(StatusCode::NOT_FOUND, "no such draft\n");
     }
     let rev = match resp.json::<serde_json::Value>().await {
@@ -207,10 +246,10 @@ async fn latest(app: &App, name: &str, xff: &str) -> Response {
         _ => None,
     };
     let Some(rev) = rev.filter(|r| r.len() == 2 && r.bytes().all(|b| b.is_ascii_digit())) else {
-        eprintln!("{name} xff={xff}: datatracker {status}, no usable rev");
+        eprintln!("{name}: datatracker {status}, no usable rev");
         return plain(StatusCode::BAD_GATEWAY, "datatracker gave no revision\n");
     };
-    eprintln!("{name} xff={xff}: latest -> {rev}");
+    eprintln!("{name}: latest -> {rev}");
     let mut out = HeaderMap::new();
     // Relative, so the redirect stays on whatever host and scheme the client used.
     out.insert(
@@ -218,7 +257,7 @@ async fn latest(app: &App, name: &str, xff: &str) -> Response {
         HeaderValue::from_str(&format!("{name}-{rev}.xml")).unwrap(),
     );
     out.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
-    cors(&mut out);
+    common_headers(&mut out);
     (StatusCode::FOUND, out).into_response()
 }
 
@@ -228,6 +267,11 @@ async fn main() {
         .unwrap_or_else(|_| "127.0.0.1:8096".into())
         .parse()
         .expect("LISTEN must be ip:port");
+    let max_in_flight = std::env::var("MAX_IN_FLIGHT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n: &usize| n > 0)
+        .unwrap_or(DEFAULT_MAX_IN_FLIGHT);
     let client = reqwest::Client::builder()
         .user_agent(concat!(
             "ietf-draft-proxy/",
@@ -242,7 +286,10 @@ async fn main() {
     let app = Router::new()
         .route("/archive/id/{file}", get(draft).options(draft))
         .fallback(|| async { plain(StatusCode::NOT_FOUND, "not found\n") })
-        .with_state(App { client });
+        .with_state(App {
+            client,
+            slots: Arc::new(tokio::sync::Semaphore::new(max_in_flight)),
+        });
     let listener = tokio::net::TcpListener::bind(listen).await.expect("bind");
     eprintln!("listening on {listen}");
     axum::serve(
